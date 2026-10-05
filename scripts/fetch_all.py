@@ -40,6 +40,11 @@ def main():
                 seen[h] = a
         time.sleep(2)
     regional = list(seen.values())
+    if not regional:
+        # Source gap (all 3 circles empty/failed) - refuse to wipe good data.
+        # Exit 2 = deliberate skip, NOT a failure: caller should not push.
+        print('EMPTY regional feed from all 3 circles - refusing to overwrite good data')
+        raise SystemExit(2)
     regional_cs = set()
     for a in regional:
         cs = (a.get('flight') or '').strip()
