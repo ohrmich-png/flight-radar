@@ -1,9 +1,11 @@
 'use strict';
-/* Flight Radar — Israel. Data: OpenSky Network (ADS-B) via CORS worker; routes: adsbdb. */
+/* Flight Radar — Israel. Data: adsb.lol (community ADS-B) via scheduled
+   GitHub Action -> data branch -> raw.githubusercontent (no CORS issues).
+   Routes enriched via adsbdb (direct, CORS-open). */
 
-const WORKER = 'https://bus-times-cors.ohrmich.workers.dev/?url=';
-const BBOX = { lamin: 29.3, lamax: 33.5, lomin: 34.0, lomax: 36.0 };
+const DATA_URL = 'https://raw.githubusercontent.com/ohrmich-png/flight-radar/data/flights.json';
 const POLL_MS = 60_000;
+const STALE_MS = 12 * 60_000;
 const IL_AIRPORTS = ['TLV', 'ETM', 'HFA']; // Ben Gurion, Ramon, Haifa (IATA)
 
 const I18N = {
@@ -15,11 +17,9 @@ const I18N = {
     alt: 'גובה (רגל)', speed: 'מהירות (קשר)', heading: 'כיוון', vrate: 'קצב אנכי',
     legend: 'גובה', legLow: 'נמוך', legMid: 'בינוני', legHigh: 'גבוה',
     loading: 'סורק את השמיים…',
-    credit: 'נתוני טיסות: OpenSky Network (ADS-B קהילתי) · מסלולים: adsbdb',
+    credit: 'נתוני טיסות: adsb.lol (ADS-B קהילתי) · מסלולים: adsbdb',
     noFlights: 'אין טיסות כרגע בתצוגה זו',
-    quotaPaused: 'מכסת העדכונים היומית הסתיימה — ממשיך מחר',
-    quotaLeft: (n) => `נשארו ${n} עדכונים להיום`,
-    feedError: 'חיבור נתוני הטיסות נכשל — מנסה שוב…',
+    feedError: 'נתוני הטיסות אינם מעודכנים — מנסה שוב…',
     unknown: 'לא ידוע', toIsrael: 'לישראל', fromIsrael: 'מישראל', overflying: 'חולף מעל',
     ftMin: 'רגל/דקה',
   },
@@ -31,11 +31,9 @@ const I18N = {
     alt: 'Altitude (ft)', speed: 'Speed (kts)', heading: 'Heading', vrate: 'Vert. rate',
     legend: 'Altitude', legLow: 'Low', legMid: 'Mid', legHigh: 'High',
     loading: 'Scanning the skies…',
-    credit: 'Flight data: OpenSky Network (community ADS-B) · Routes: adsbdb',
+    credit: 'Flight data: adsb.lol (community ADS-B) · Routes: adsbdb',
     noFlights: 'No flights in this view right now',
-    quotaPaused: 'Daily update quota reached — resumes tomorrow',
-    quotaLeft: (n) => `${n} updates left today`,
-    feedError: 'Flight feed unreachable — retrying…',
+    feedError: 'Flight data is stale — retrying…',
     unknown: 'Unknown', toIsrael: 'To Israel', fromIsrael: 'From Israel', overflying: 'Overflying',
     ftMin: 'ft/min',
   },
@@ -43,13 +41,11 @@ const I18N = {
 
 let lang = localStorage.getItem('fr_lang') || 'he';
 let map = null;
-let markers = {};       // icao24 -> { marker, state }
-let flights = [];       // last enriched state list
-let routeCache = {};    // callsign -> {origin, dest} | null
-let selectedIcao = null;
+let markers = {};       // hex -> { marker, f }
+let flights = [];       // normalized flight objects
+let routeCache = {};    // callsign -> {origin, dest, ...} | null
+let selectedHex = null;
 let activeFilter = 'all';
-let quotaPaused = false;
-let callsToday = 0;
 let countdownTimer = null;
 let secondsLeft = POLL_MS / 1000;
 let failStreak = 0;
@@ -59,11 +55,30 @@ const t = (k, ...a) => {
   return typeof v === 'function' ? v(...a) : v;
 };
 const $ = (id) => document.getElementById(id);
-const M_TO_FT = 3.28084, MS_TO_KT = 1.94384;
 
-const openskyUrl = () =>
-  `https://opensky-network.org/api/states/all?lamin=${BBOX.lamin}&lamax=${BBOX.lamax}&lomin=${BBOX.lomin}&lomax=${BBOX.lomax}`;
-const proxied = (url) => WORKER + encodeURIComponent(url);
+function escapeHtml(s) {
+  return String(s == null ? '' : s).replace(/[&<>"']/g, (c) =>
+    ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+
+// adsb.lol -> normalized
+function normAc(a) {
+  return {
+    hex: String(a.hex || '').toLowerCase(),
+    cs: (a.flight || '').trim(),
+    lat: a.lat, lon: a.lon,
+    altFt: typeof a.alt_baro === 'number' ? Math.round(a.alt_baro) : null,
+    kts: typeof a.gs === 'number' ? Math.round(a.gs) : null,
+    track: typeof a.track === 'number' ? a.track : 0,
+    vrate: typeof a.baro_rate === 'number' ? Math.round(a.baro_rate) : null,
+    reg: a.r || '', type: a.t || '',
+  };
+}
+function validAc(a) {
+  return a && a.lat != null && a.lon != null
+    && !String(a.hex || '').startsWith('~')
+    && a.alt_baro !== 'ground';
+}
 
 function applyLang() {
   document.documentElement.lang = lang;
@@ -72,7 +87,7 @@ function applyLang() {
   document.querySelectorAll('[data-i18n-ph]').forEach((el) => { el.placeholder = t(el.dataset.i18nPh); });
   $('langBtn').textContent = lang === 'he' ? 'EN' : 'עב';
   renderList();
-  if (selectedIcao && markers[selectedIcao]) showDetail(markers[selectedIcao].state);
+  if (selectedHex && markers[selectedHex]) showDetail(markers[selectedHex].f);
 }
 
 function altColor(altFt) {
@@ -82,46 +97,30 @@ function altColor(altFt) {
   return '#f2ead8';
 }
 
-function planeIcon(state, selected) {
-  const track = state[10] || 0;
-  const altFt = state[7] != null ? Math.round(state[7] * M_TO_FT) : null;
-  const color = altColor(altFt);
-  const cs = (state[1] || '').trim();
+function planeIcon(f, selected) {
+  const color = altColor(f.altFt);
   return L.divIcon({
     className: 'plane-marker' + (selected ? ' selected' : ''),
-    html: `<div class="plane-glyph" style="transform: rotate(${track}deg)">`
+    html: `<div class="plane-glyph" style="transform: rotate(${f.track}deg)">`
       + `<svg viewBox="0 0 24 24"><path fill="${color}" d="M21 16v-2l-8-5V3.5c0-.83-.67-1.5-1.5-1.5S10 2.67 10 3.5V9l-8 5v2l8-2.5V19l-2 1.5V22l3.5-1 3.5 1v-1.5L13 19v-5.5l8 2.5z"/></svg></div>`
-      + (selected && cs ? `<div class="plane-label">${escapeHtml(cs)}</div>` : ''),
+      + (selected && f.cs ? `<div class="plane-label">${escapeHtml(f.cs)}</div>` : ''),
     iconSize: [30, 30], iconAnchor: [15, 15],
   });
 }
 
-function escapeHtml(s) {
-  return String(s == null ? '' : s).replace(/[&<>"']/g, (c) =>
-    ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
-}
-
-function todayKey() { return 'fr_calls_' + new Date().toISOString().slice(0, 10); }
-
 async function fetchStates() {
-  if (quotaPaused) return;
-  const key = todayKey();
-  callsToday = parseInt(localStorage.getItem(key) || '0', 10);
-  if (callsToday >= 395) { setQuotaPaused(); return; }
   try {
-    const res = await fetch(proxied(openskyUrl()));
-    if (res.status === 429) { setQuotaPaused(); return; }
+    const res = await fetch(DATA_URL + '?t=' + Date.now(), { cache: 'no-store' });
     if (!res.ok) throw new Error('http ' + res.status);
     const data = await res.json();
-    callsToday += 1;
-    localStorage.setItem(key, String(callsToday));
-    updateQuotaNote();
-    const states = (data.states || []).filter((s) => s[5] != null && s[6] != null && !s[8]);
+    const ageMs = Date.now() - (data.now || 0);
+    if (ageMs > STALE_MS) throw new Error('stale');
+    const list = (data.ac || []).filter(validAc).map(normAc);
     failStreak = 0;
-    updateMarkers(states);
-    enrichRoutes(states);
+    $('quotaNote').hidden = true;
+    updateMarkers(list);
+    enrichRoutes(list);
   } catch (e) {
-    // keep old markers on transient errors; surface persistent failures
     failStreak += 1;
     if (failStreak >= 2) {
       const q = $('quotaNote');
@@ -129,59 +128,43 @@ async function fetchStates() {
       q.textContent = t('feedError');
     }
   }
-  if (failStreak === 0) { /* ok */ }
   $('loader').classList.add('done');
   secondsLeft = POLL_MS / 1000;
 }
 
-function setQuotaPaused() {
-  quotaPaused = true;
-  const q = $('quotaNote');
-  q.hidden = false;
-  q.textContent = t('quotaPaused');
-}
-
-function updateQuotaNote() {
-  const left = 395 - callsToday;
-  const q = $('quotaNote');
-  if (left <= 60) { q.hidden = false; q.textContent = t('quotaLeft', left); }
-  else q.hidden = true;
-}
-
-function updateMarkers(states) {
+function updateMarkers(list) {
   const seen = new Set();
-  states.forEach((s) => {
-    const icao = s[0];
-    seen.add(icao);
-    const selected = icao === selectedIcao;
-    if (markers[icao]) {
-      markers[icao].marker.setLatLng([s[6], s[5]]);
-      markers[icao].marker.setIcon(planeIcon(s, selected));
-      markers[icao].state = s;
+  list.forEach((f) => {
+    seen.add(f.hex);
+    const selected = f.hex === selectedHex;
+    if (markers[f.hex]) {
+      markers[f.hex].marker.setLatLng([f.lat, f.lon]);
+      markers[f.hex].marker.setIcon(planeIcon(f, selected));
+      markers[f.hex].f = f;
     } else {
-      const m = L.marker([s[6], s[5]], { icon: planeIcon(s, selected) });
-      m.on('click', () => selectFlight(icao));
+      const m = L.marker([f.lat, f.lon], { icon: planeIcon(f, selected) });
+      m.on('click', () => selectFlight(f.hex));
       m.addTo(map);
-      markers[icao] = { marker: m, state: s };
+      markers[f.hex] = { marker: m, f };
     }
   });
-  Object.keys(markers).forEach((icao) => {
-    if (!seen.has(icao)) {
-      map.removeLayer(markers[icao].marker);
-      delete markers[icao];
-      if (selectedIcao === icao) { selectedIcao = null; $('flightDetail').hidden = true; }
+  Object.keys(markers).forEach((hex) => {
+    if (!seen.has(hex)) {
+      map.removeLayer(markers[hex].marker);
+      delete markers[hex];
+      if (selectedHex === hex) { selectedHex = null; $('flightDetail').hidden = true; }
     }
   });
-  flights = states;
-  $('planeCount').textContent = states.length;
+  flights = list;
+  $('planeCount').textContent = list.length;
   applyFilter();
 }
 
-async function enrichRoutes(states) {
-  const fresh = states.map((s) => (s[1] || '').trim()).filter((cs) => cs && !(cs in routeCache));
+async function enrichRoutes(list) {
+  const fresh = list.map((f) => f.cs).filter((cs) => cs && !(cs in routeCache));
   const uniq = [...new Set(fresh)].slice(0, 40);
   for (const cs of uniq) {
-    routeCache[cs] = null; // mark in-flight
+    routeCache[cs] = null;
     try {
       const res = await fetch('https://api.adsbdb.com/v0/callsign/' + encodeURIComponent(cs));
       if (res.ok) {
@@ -198,7 +181,7 @@ async function enrichRoutes(states) {
     await new Promise((r) => setTimeout(r, 250));
   }
   applyFilter();
-  if (selectedIcao && markers[selectedIcao]) showDetail(markers[selectedIcao].state);
+  if (selectedHex && markers[selectedHex]) showDetail(markers[selectedHex].f);
 }
 
 function flightClass(cs) {
@@ -214,76 +197,64 @@ function flightClass(cs) {
 function applyFilter() {
   const q = $('searchInput').value.trim().toUpperCase();
   const rows = flights
-    .map((s) => ({ s, cs: (s[1] || '').trim() }))
-    .filter(({ cs }) => !q || cs.includes(q))
-    .filter(({ cs }) => {
-      if (activeFilter === 'all') return true;
-      const c = flightClass(cs);
-      return c === activeFilter;
-    })
+    .filter((f) => !q || f.cs.includes(q))
+    .filter((f) => activeFilter === 'all' || flightClass(f.cs) === activeFilter)
     .sort((a, b) => a.cs.localeCompare(b.cs));
-  // dim markers not in filter
-  const visible = new Set(rows.map((r) => r.s[0]));
-  Object.entries(markers).forEach(([icao, { marker }]) => {
-    marker.setOpacity(visible.has(icao) ? 1 : 0.18);
+  const visible = new Set(rows.map((f) => f.hex));
+  Object.entries(markers).forEach(([hex, { marker }]) => {
+    marker.setOpacity(visible.has(hex) ? 1 : 0.18);
   });
   renderList(rows);
 }
 
 function renderList(rows) {
   const box = $('flightList');
-  const list = rows || flights.map((s) => ({ s, cs: (s[1] || '').trim() }));
+  const list = rows || flights;
   if (!list.length) {
     box.innerHTML = `<div class="quota">${t('noFlights')}</div>`;
     return;
   }
-  box.innerHTML = list.map(({ s, cs }) => {
-    const icao = s[0];
-    const altFt = s[7] != null ? Math.round(s[7] * M_TO_FT) : null;
-    const r = routeCache[cs];
+  box.innerHTML = list.map((f) => {
+    const r = routeCache[f.cs];
     const rt = r ? `${escapeHtml(r.origin)} → ${escapeHtml(r.dest)}` : '···';
-    return `<div class="flight-row${icao === selectedIcao ? ' selected' : ''}" data-icao="${icao}">`
-      + `<i class="altdot" style="background:${altColor(altFt)}"></i>`
-      + `<span class="cs">${escapeHtml(cs || t('unknown'))}</span>`
+    return `<div class="flight-row${f.hex === selectedHex ? ' selected' : ''}" data-hex="${f.hex}">`
+      + `<i class="altdot" style="background:${altColor(f.altFt)}"></i>`
+      + `<span class="cs">${escapeHtml(f.cs || t('unknown'))}</span>`
       + `<span class="rt">${rt}</span></div>`;
   }).join('');
   box.querySelectorAll('.flight-row').forEach((el) =>
-    el.addEventListener('click', () => selectFlight(el.dataset.icao)));
+    el.addEventListener('click', () => selectFlight(el.dataset.hex)));
 }
 
-function selectFlight(icao) {
-  selectedIcao = icao;
-  const rec = markers[icao];
+function selectFlight(hex) {
+  selectedHex = hex;
+  const rec = markers[hex];
   if (!rec) return;
-  rec.marker.setIcon(planeIcon(rec.state, true));
-  Object.entries(markers).forEach(([k, { marker, state }]) => {
-    if (k !== icao) marker.setIcon(planeIcon(state, false));
+  rec.marker.setIcon(planeIcon(rec.f, true));
+  Object.entries(markers).forEach(([k, { marker, f }]) => {
+    if (k !== hex) marker.setIcon(planeIcon(f, false));
   });
   map.flyTo(rec.marker.getLatLng(), Math.max(map.getZoom(), 9), { duration: 0.7 });
-  showDetail(rec.state);
+  showDetail(rec.f);
   renderList();
 }
 
 function fmtNum(n) { return n == null || isNaN(n) ? '—' : Math.round(n).toLocaleString('en-US'); }
 
-function showDetail(s) {
-  const cs = (s[1] || '').trim();
-  const altFt = s[7] != null ? s[7] * M_TO_FT : null;
-  const kts = s[9] != null ? s[9] * MS_TO_KT : null;
-  const vr = s[11] != null ? s[11] * M_TO_FT * 60 : null;
-  const r = routeCache[cs];
-  $('dCallsign').textContent = cs || t('unknown');
+function showDetail(f) {
+  const r = routeCache[f.cs];
+  $('dCallsign').textContent = f.cs || t('unknown');
   $('dOrigin').textContent = r ? r.origin : '···';
   $('dDest').textContent = r ? r.dest : '···';
   $('dRouteSub').textContent = r
     ? `${r.originName} → ${r.destName}`
-    : ({ to: t('toIsrael'), from: t('fromIsrael'), over: t('overflying'), unknown: '', domestic: '' }[flightClass(cs)] || '');
-  $('dAlt').textContent = fmtNum(altFt);
-  $('dSpeed').textContent = fmtNum(kts);
-  $('dTrack').textContent = s[10] != null ? Math.round(s[10]) + '°' : '—';
-  $('dVrate').textContent = vr == null ? '—' : (vr > 0 ? '+' : '') + fmtNum(vr) + ' ' + t('ftMin');
-  $('dIcao').textContent = 'ICAO ' + s[0].toUpperCase();
-  $('dCountry').textContent = s[2] || '';
+    : ({ to: t('toIsrael'), from: t('fromIsrael'), over: t('overflying'), unknown: '', domestic: '' }[flightClass(f.cs)] || '');
+  $('dAlt').textContent = fmtNum(f.altFt);
+  $('dSpeed').textContent = fmtNum(f.kts);
+  $('dTrack').textContent = f.track != null ? Math.round(f.track) + '°' : '—';
+  $('dVrate').textContent = f.vrate == null ? '—' : (f.vrate > 0 ? '+' : '') + fmtNum(f.vrate) + ' ' + t('ftMin');
+  $('dIcao').textContent = f.reg ? f.reg + (f.type ? ' · ' + f.type : '') : 'ICAO ' + f.hex.toUpperCase();
+  $('dCountry').textContent = '';
   $('flightDetail').hidden = false;
 }
 
@@ -314,10 +285,10 @@ function boot() {
   $('searchInput').addEventListener('input', applyFilter);
   $('detailClose').addEventListener('click', () => {
     $('flightDetail').hidden = true;
-    if (selectedIcao && markers[selectedIcao]) {
-      markers[selectedIcao].marker.setIcon(planeIcon(markers[selectedIcao].state, false));
+    if (selectedHex && markers[selectedHex]) {
+      markers[selectedHex].marker.setIcon(planeIcon(markers[selectedHex].f, false));
     }
-    selectedIcao = null;
+    selectedHex = null;
     renderList();
   });
   $('langBtn').addEventListener('click', () => {
@@ -331,9 +302,8 @@ function boot() {
   setInterval(fetchStates, POLL_MS);
   countdownTimer = setInterval(() => {
     secondsLeft = Math.max(0, secondsLeft - 1);
-    $('countdown').textContent = quotaPaused ? '—' : secondsLeft + 's';
+    $('countdown').textContent = secondsLeft + 's';
   }, 1000);
-  updateQuotaNote();
 }
 
 document.addEventListener('DOMContentLoaded', boot);
