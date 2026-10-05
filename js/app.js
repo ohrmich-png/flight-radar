@@ -19,6 +19,7 @@ const I18N = {
     noFlights: 'אין טיסות כרגע בתצוגה זו',
     quotaPaused: 'מכסת העדכונים היומית הסתיימה — ממשיך מחר',
     quotaLeft: (n) => `נשארו ${n} עדכונים להיום`,
+    feedError: 'חיבור נתוני הטיסות נכשל — מנסה שוב…',
     unknown: 'לא ידוע', toIsrael: 'לישראל', fromIsrael: 'מישראל', overflying: 'חולף מעל',
     ftMin: 'רגל/דקה',
   },
@@ -34,6 +35,7 @@ const I18N = {
     noFlights: 'No flights in this view right now',
     quotaPaused: 'Daily update quota reached — resumes tomorrow',
     quotaLeft: (n) => `${n} updates left today`,
+    feedError: 'Flight feed unreachable — retrying…',
     unknown: 'Unknown', toIsrael: 'To Israel', fromIsrael: 'From Israel', overflying: 'Overflying',
     ftMin: 'ft/min',
   },
@@ -50,6 +52,7 @@ let quotaPaused = false;
 let callsToday = 0;
 let countdownTimer = null;
 let secondsLeft = POLL_MS / 1000;
+let failStreak = 0;
 
 const t = (k, ...a) => {
   const v = (I18N[lang] && I18N[lang][k]) || I18N.en[k] || k;
@@ -114,11 +117,19 @@ async function fetchStates() {
     localStorage.setItem(key, String(callsToday));
     updateQuotaNote();
     const states = (data.states || []).filter((s) => s[5] != null && s[6] != null && !s[8]);
+    failStreak = 0;
     updateMarkers(states);
     enrichRoutes(states);
   } catch (e) {
-    // keep old markers on transient errors
+    // keep old markers on transient errors; surface persistent failures
+    failStreak += 1;
+    if (failStreak >= 2) {
+      const q = $('quotaNote');
+      q.hidden = false;
+      q.textContent = t('feedError');
+    }
   }
+  if (failStreak === 0) { /* ok */ }
   $('loader').classList.add('done');
   secondsLeft = POLL_MS / 1000;
 }
@@ -172,7 +183,7 @@ async function enrichRoutes(states) {
   for (const cs of uniq) {
     routeCache[cs] = null; // mark in-flight
     try {
-      const res = await fetch(proxied('https://api.adsbdb.com/v0/callsign/' + encodeURIComponent(cs)));
+      const res = await fetch('https://api.adsbdb.com/v0/callsign/' + encodeURIComponent(cs));
       if (res.ok) {
         const d = await res.json();
         const fr = d && d.response && d.response.flightroute;
@@ -284,8 +295,8 @@ function tickClock() {
 function initMap() {
   map = L.map('map', { zoomControl: true, worldCopyJump: true }).setView([31.6, 34.9], 8);
   map.zoomControl.setPosition('bottomright');
-  L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
-    attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> &copy; <a href="https://carto.com/attributions">CARTO</a>',
+  L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Dark_Gray_Base/MapServer/tile/{z}/{y}/{x}', {
+    attribution: '&copy; <a href="https://www.esri.com">Esri</a> &copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>',
     maxZoom: 19,
   }).addTo(map);
 }
