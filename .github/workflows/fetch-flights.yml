@@ -1,0 +1,30 @@
+name: fetch-flights
+# Polls adsb.lol every 3 minutes and force-pushes a single-commit
+# data branch (flights.json) that the site reads as static JSON.
+# No API keys needed; gentle on the community API.
+on:
+  schedule:
+    - cron: '*/3 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fetch live ADS-B data
+        run: |
+          curl -s --max-time 60 "https://api.adsb.lol/v2/point/31.5/34.9/250" -o /tmp/flights.json
+          python3 -c "import json; d=json.load(open('/tmp/flights.json')); print('aircraft:', len(d.get('ac', [])))"
+      - name: Push to data branch (single commit)
+        run: |
+          rm -rf /tmp/data-push && mkdir -p /tmp/data-push && cd /tmp/data-push
+          git init -q
+          git config user.name "flight-radar-bot"
+          git config user.email "flight-radar-bot@local"
+          cp /tmp/flights.json ./flights.json
+          git add flights.json
+          git commit -qm "live flight data $(date -u '+%Y-%m-%d %H:%M UTC')"
+          git push -q --force "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" HEAD:data
