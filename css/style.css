@@ -93,6 +93,24 @@ html[lang="en"] .stat-num { font-family: var(--serif-en); }
 }
 #searchInput::placeholder { color: var(--muted); }
 #searchInput:focus { outline: none; border-color: var(--gold); }
+.il-toggle {
+  display: flex; align-items: center; gap: 0.55rem;
+  font-size: 0.8rem; color: var(--muted); cursor: pointer;
+  user-select: none; padding: 0.1rem 0.2rem;
+}
+.il-toggle input { display: none; }
+.il-toggle .switch {
+  width: 34px; height: 19px; border-radius: 999px; flex-shrink: 0;
+  background: rgba(139,147,169,0.35); position: relative; transition: background 0.2s;
+}
+.il-toggle .switch::after {
+  content: ''; position: absolute; top: 2.5px; inset-inline-start: 3px;
+  width: 14px; height: 14px; border-radius: 50%; background: #cfd4e0;
+  transition: transform 0.2s;
+}
+.il-toggle input:checked + .switch { background: var(--gold); }
+.il-toggle input:checked + .switch::after { transform: translateX(-14px); background: #131a2e; }
+html[dir="ltr"] .il-toggle input:checked + .switch::after { transform: translateX(14px); }
 .quota { font-size: 0.7rem; color: var(--muted); text-align: center; }
 
 /* ---------- flight detail card ---------- */
