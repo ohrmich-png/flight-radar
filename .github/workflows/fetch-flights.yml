@@ -1,11 +1,11 @@
 name: fetch-flights
-# Polls adsb.lol (3 overlapping 250nm circles: Israel, west Med/Turkey,
-# east Jordan/Iraq/Saudi) every 4 minutes, merges + dedupes by hex, and
-# force-pushes a single-commit data branch (flights.json) that the site
-# reads as static JSON. No API keys needed.
+# Every 5 min: regional ADS-B feed (3 circles) + Israel-callsign watchlist
+# + global tracking of watchlisted flights. Force-pushes a single commit
+# (flights.json, global.json, watchlist.json) to the `data` branch.
+# No API keys needed.
 on:
   schedule:
-    - cron: '*/4 * * * *'
+    - cron: '*/5 * * * *'
   workflow_dispatch:
 
 permissions:
@@ -15,35 +15,16 @@ jobs:
   fetch:
     runs-on: ubuntu-latest
     steps:
-      - name: Fetch live ADS-B data (3 regions)
-        run: |
-          i=0
-          for pt in "31.5,34.9" "36.0,29.0" "31.0,41.0"; do
-            i=$((i+1))
-            lat=${pt%,*}; lon=${pt#*,}
-            curl -s --max-time 60 "https://api.adsb.lol/v2/point/$lat/$lon/250" -o /tmp/p$i.json
-            sleep 2
-          done
-          python3 - <<'EOF'
-          import json
-          seen, now = {}, 0
-          for i in (1, 2, 3):
-              d = json.load(open(f'/tmp/p{i}.json'))
-              now = max(now, d.get('now', 0))
-              for a in d.get('ac', []):
-                  h = str(a.get('hex', '')).lower()
-                  if h and not h.startswith('~') and h not in seen:
-                      seen[h] = a
-          json.dump({'now': now, 'ac': list(seen.values())}, open('/tmp/flights.json', 'w'))
-          print('aircraft:', len(seen))
-          EOF
+      - uses: actions/checkout@v4
+      - name: Fetch + build watchlist + track global
+        run: python3 scripts/fetch_all.py
       - name: Push to data branch (single commit)
         run: |
           rm -rf /tmp/data-push && mkdir -p /tmp/data-push && cd /tmp/data-push
           git init -q
           git config user.name "flight-radar-bot"
           git config user.email "flight-radar-bot@local"
-          cp /tmp/flights.json ./flights.json
-          git add flights.json
+          cp /tmp/flights.json /tmp/global.json /tmp/watchlist.json ./
+          git add flights.json global.json watchlist.json
           git commit -qm "live flight data $(date -u '+%Y-%m-%d %H:%M UTC')"
           git push -q --force "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" HEAD:data
