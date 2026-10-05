@@ -4,6 +4,7 @@
    Routes enriched via adsbdb (direct, CORS-open). */
 
 const DATA_URL = 'https://raw.githubusercontent.com/ohrmich-png/flight-radar/data/flights.json';
+const GLOBAL_URL = 'https://raw.githubusercontent.com/ohrmich-png/flight-radar/data/global.json';
 const POLL_MS = 60_000;
 const STALE_MS = 15 * 60_000;
 const IL_AIRPORTS = ['TLV', 'ETM', 'HFA']; // Ben Gurion, Ramon, Haifa (IATA)
@@ -133,12 +134,30 @@ function planeIcon(f, selected) {
 
 async function fetchStates() {
   try {
-    const res = await fetch(DATA_URL + '?t=' + Date.now(), { cache: 'no-store' });
-    if (!res.ok) throw new Error('http ' + res.status);
-    const data = await res.json();
+    const [r1, r2] = await Promise.all([
+      fetch(DATA_URL + '?t=' + Date.now(), { cache: 'no-store' }),
+      fetch(GLOBAL_URL + '?t=' + Date.now(), { cache: 'no-store' }).catch(() => null),
+    ]);
+    if (!r1.ok) throw new Error('http ' + r1.status);
+    const data = await r1.json();
     const ageMs = Date.now() - (data.now || 0);
     if (ageMs > STALE_MS) throw new Error('stale');
-    const list = (data.ac || []).filter(validAc).map(normAc);
+    const seen = new Set();
+    const list = [];
+    const pushAc = (a) => {
+      const h = String(a.hex || '').toLowerCase();
+      if (!h || seen.has(h)) return;
+      seen.add(h);
+      list.push(normAc(a));
+    };
+    (data.ac || []).filter(validAc).forEach(pushAc);
+    // global Israel-related flights (dedupe against regional)
+    try {
+      if (r2 && r2.ok) {
+        const g = await r2.json();
+        (g.ac || []).filter(validAc).forEach(pushAc);
+      }
+    } catch (e) { /* global optional */ }
     failStreak = 0;
     $('quotaNote').hidden = true;
     updateMarkers(list);
