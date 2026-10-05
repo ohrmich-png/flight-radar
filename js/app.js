@@ -5,8 +5,9 @@
 
 const DATA_URL = 'https://raw.githubusercontent.com/ohrmich-png/flight-radar/data/flights.json';
 const POLL_MS = 60_000;
-const STALE_MS = 12 * 60_000;
+const STALE_MS = 15 * 60_000;
 const IL_AIRPORTS = ['TLV', 'ETM', 'HFA']; // Ben Gurion, Ramon, Haifa (IATA)
+const IL_BBOX = { lamin: 29.2, lamax: 33.6, lomin: 33.9, lomax: 36.1 };
 
 const I18N = {
   he: {
@@ -21,7 +22,7 @@ const I18N = {
     noFlights: 'אין טיסות כרגע בתצוגה זו',
     feedError: 'נתוני הטיסות אינם מעודכנים — מנסה שוב…',
     unknown: 'לא ידוע', toIsrael: 'לישראל', fromIsrael: 'מישראל', overflying: 'חולף מעל',
-    ftMin: 'רגל/דקה',
+    ftMin: 'רגל/דקה', ilOnly: 'רק טיסות ישראל',
   },
   en: {
     title: 'Flight Radar', subtitle: 'Israeli skies · live',
@@ -35,7 +36,7 @@ const I18N = {
     noFlights: 'No flights in this view right now',
     feedError: 'Flight data is stale — retrying…',
     unknown: 'Unknown', toIsrael: 'To Israel', fromIsrael: 'From Israel', overflying: 'Overflying',
-    ftMin: 'ft/min',
+    ftMin: 'ft/min', ilOnly: 'Israel flights only',
   },
 };
 
@@ -43,12 +44,34 @@ let lang = localStorage.getItem('fr_lang') || 'he';
 let map = null;
 let markers = {};       // hex -> { marker, f }
 let flights = [];       // normalized flight objects
-let routeCache = {};    // callsign -> {origin, dest, ...} | null
+let routeCache = {};    // callsign -> {origin, dest, ...} | null (persisted)
 let selectedHex = null;
 let activeFilter = 'all';
+let israelOnly = true;
 let countdownTimer = null;
 let secondsLeft = POLL_MS / 1000;
 let failStreak = 0;
+
+function loadRouteCache() {
+  try {
+    const raw = localStorage.getItem('fr_routes');
+    if (!raw) return;
+    const d = JSON.parse(raw);
+    const week = 7 * 86400_000, now = Date.now();
+    Object.entries(d).forEach(([cs, v]) => {
+      if (v && v.ts && now - v.ts < week) routeCache[cs] = v.r;
+    });
+  } catch (e) { /* ignore */ }
+}
+function saveRouteCache() {
+  try {
+    const d = {};
+    Object.entries(routeCache).forEach(([cs, r]) => {
+      if (r) d[cs] = { r, ts: Date.now() };
+    });
+    localStorage.setItem('fr_routes', JSON.stringify(d));
+  } catch (e) { /* ignore */ }
+}
 
 const t = (k, ...a) => {
   const v = (I18N[lang] && I18N[lang][k]) || I18N.en[k] || k;
@@ -180,6 +203,7 @@ async function enrichRoutes(list) {
     } catch (e) { /* leave null */ }
     await new Promise((r) => setTimeout(r, 250));
   }
+  saveRouteCache();
   applyFilter();
   if (selectedHex && markers[selectedHex]) showDetail(markers[selectedHex].f);
 }
@@ -194,10 +218,23 @@ function flightClass(cs) {
   return 'domestic';
 }
 
+function inIsrael(f) {
+  return f.lat >= IL_BBOX.lamin && f.lat <= IL_BBOX.lamax
+      && f.lon >= IL_BBOX.lomin && f.lon <= IL_BBOX.lomax;
+}
+function routeTouchesIsrael(cs) {
+  const r = routeCache[cs];
+  return !!r && (IL_AIRPORTS.includes(r.origin) || IL_AIRPORTS.includes(r.dest));
+}
+function isIsraelRelevant(f) {
+  return inIsrael(f) || routeTouchesIsrael(f.cs);
+}
+
 function applyFilter() {
   const q = $('searchInput').value.trim().toUpperCase();
   const rows = flights
     .filter((f) => !q || f.cs.includes(q))
+    .filter((f) => !israelOnly || isIsraelRelevant(f))
     .filter((f) => activeFilter === 'all' || flightClass(f.cs) === activeFilter)
     .sort((a, b) => a.cs.localeCompare(b.cs));
   const visible = new Set(rows.map((f) => f.hex));
@@ -273,6 +310,7 @@ function initMap() {
 }
 
 function boot() {
+  loadRouteCache();
   applyLang();
   initMap();
   document.querySelectorAll('#filterSeg .seg-btn').forEach((b) =>
@@ -283,6 +321,10 @@ function boot() {
       applyFilter();
     }));
   $('searchInput').addEventListener('input', applyFilter);
+  $('ilOnly').addEventListener('change', (e) => {
+    israelOnly = e.target.checked;
+    applyFilter();
+  });
   $('detailClose').addEventListener('click', () => {
     $('flightDetail').hidden = true;
     if (selectedHex && markers[selectedHex]) {
