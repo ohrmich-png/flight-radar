@@ -6,11 +6,16 @@
    (via adsbdb, persisted in watchlist.json on the data branch).
 3. Track every watchlisted callsign globally via adsb.lol -> global.json.
 4. All three files are force-pushed as a single commit to the `data` branch.
+
+Network I/O is parallelised with threads: the watchlist grows over time
+(500+ callsigns), and sequential per-callsign queries no longer finish
+inside the 5-minute cadence. Logic and output format are unchanged.
 """
 import json
 import time
 import urllib.parse
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 
 REPO = 'ohrmich-png/flight-radar'
 REGIONS = [(31.5, 34.9), (36.0, 29.0), (31.0, 41.0)]  # Israel, west Med, east
@@ -24,13 +29,41 @@ def get(url, timeout=60):
         return json.load(r)
 
 
+def fetch_region(lat_lon):
+    lat, lon = lat_lon
+    try:
+        d = get(f'https://api.adsb.lol/v2/point/{lat}/{lon}/250')
+        return (lat, lon, d, None)
+    except Exception as e:
+        return (lat, lon, None, e)
+
+
+def enrich_callsign(cs):
+    try:
+        d = get('https://api.adsbdb.com/v0/callsign/' + urllib.parse.quote(cs), timeout=30)
+        fr = (d.get('response') or {}).get('flightroute') or {}
+        o = ((fr.get('origin') or {}).get('iata_code') or '')
+        dst = ((fr.get('destination') or {}).get('iata_code') or '')
+        return (cs, o in IL or dst in IL)
+    except Exception:
+        return (cs, None)
+
+
+def track_callsign(cs):
+    try:
+        d = get('https://api.adsb.lol/v2/callsign/' + urllib.parse.quote(cs), timeout=30)
+        return (cs, d.get('ac', []))
+    except Exception:
+        return (cs, [])
+
+
 def main():
-    # 1. Regional feed
+    # 1. Regional feed (3 circles in parallel)
     seen, now = {}, 0
-    for lat, lon in REGIONS:
-        try:
-            d = get(f'https://api.adsb.lol/v2/point/{lat}/{lon}/250')
-        except Exception as e:
+    with ThreadPoolExecutor(max_workers=3) as ex:
+        region_results = list(ex.map(fetch_region, REGIONS))
+    for lat, lon, d, e in region_results:
+        if e is not None:
             print('region failed', lat, lon, e)
             continue
         now = max(now, d.get('now', 0))
@@ -38,7 +71,6 @@ def main():
             h = str(a.get('hex', '')).lower()
             if h and not h.startswith('~') and h not in seen:
                 seen[h] = a
-        time.sleep(2)
     regional = list(seen.values())
     if not regional:
         # Source gap (all 3 circles empty/failed) - refuse to wipe good data.
@@ -56,28 +88,23 @@ def main():
         wl = get(DATA_RAW, timeout=30)
     except Exception:
         wl = {}
-    callsigns = wl.get('callsigns', {})   # cs -> {added, last_seen}
-    not_il = wl.get('not_il', {})         # cs -> ts (checked, not Israel-related)
+    callsigns = wl.get('callsigns', {})  # cs -> {added, last_seen}
+    not_il = wl.get('not_il', {})        # cs -> ts (checked, not Israel-related)
     ts = int(time.time())
     for cs in regional_cs:
         if cs in callsigns:
             callsigns[cs]['last_seen'] = ts
 
-    # 3. Enrich new callsigns via adsbdb
+    # 3. Enrich new callsigns via adsbdb (parallel, capped at 60)
     new_cs = [cs for cs in regional_cs if cs not in callsigns and cs not in not_il][:60]
-    for cs in new_cs:
-        try:
-            d = get('https://api.adsbdb.com/v0/callsign/' + urllib.parse.quote(cs), timeout=30)
-            fr = (d.get('response') or {}).get('flightroute') or {}
-            o = ((fr.get('origin') or {}).get('iata_code') or '')
-            dst = ((fr.get('destination') or {}).get('iata_code') or '')
-            if o in IL or dst in IL:
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        for cs, is_il in ex.map(enrich_callsign, new_cs):
+            if is_il is None:
+                continue
+            if is_il:
                 callsigns[cs] = {'added': ts, 'last_seen': ts}
             else:
                 not_il[cs] = ts
-        except Exception:
-            pass
-        time.sleep(0.3)
 
     # prune stale entries
     month_ago = ts - 30 * 86400
@@ -86,23 +113,19 @@ def main():
     callsigns = {k: v for k, v in callsigns.items()
                  if v.get('last_seen', v.get('added', ts)) > old}
 
-    # 4. Track watchlist globally (skip callsigns already seen regionally)
+    # 4. Track watchlist globally (parallel; skip callsigns already seen regionally).
+    # Merging stays single-threaded so dedup semantics are unchanged.
     have_hex = set(seen.keys())
     global_ac = []
-    for cs in list(callsigns.keys()):
-        if cs in regional_cs:
-            continue
-        try:
-            d = get('https://api.adsb.lol/v2/callsign/' + urllib.parse.quote(cs), timeout=30)
-            for a in d.get('ac', []):
+    to_track = [cs for cs in callsigns.keys() if cs not in regional_cs]
+    with ThreadPoolExecutor(max_workers=10) as ex:
+        for cs, ac_list in ex.map(track_callsign, to_track):
+            for a in ac_list:
                 h = str(a.get('hex', '')).lower()
                 if h and not h.startswith('~') and h not in have_hex \
                         and a.get('lat') is not None and a.get('lon') is not None:
                     global_ac.append(a)
                     have_hex.add(h)
-        except Exception:
-            pass
-        time.sleep(0.15)
 
     json.dump({'now': now, 'ac': regional}, open('/tmp/flights.json', 'w'))
     json.dump({'now': int(time.time() * 1000), 'ac': global_ac}, open('/tmp/global.json', 'w'))
