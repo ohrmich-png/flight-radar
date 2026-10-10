@@ -17,8 +17,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Fetch + build watchlist + track global
-        run: python3 scripts/fetch_all.py
+        id: fetch
+        run: |
+          set +e
+          python3 scripts/fetch_all.py
+          rc=$?
+          set -e
+          if [ "$rc" -eq 2 ]; then
+            echo "Empty regional feed (source gap) - deliberate skip, not a failure"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          exit "$rc"
       - name: Push to data branch (single commit)
+        if: steps.fetch.outputs.skip != 'true'
         run: |
           rm -rf /tmp/data-push && mkdir -p /tmp/data-push && cd /tmp/data-push
           git init -q
